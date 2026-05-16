@@ -1,0 +1,457 @@
+Excellent design thinking. You want a **fully externalized, config-driven parameter resolution system** with zero operator code changes when new parameters are added. Here is the complete design.
+
+---
+
+## The Core Idea
+
+```
+Environment Config File (per env)
+        +
+YAML query_parameters
+        +
+Airflow execution context (run_date etc.)
+        ↓
+Operator resolves everything at runtime
+        ↓
+Clean SQL with @params submitted to BQ
+```
+
+---
+
+## Environment Config File Design
+
+One YAML config file per environment, stored in GCS. This is the **single source of truth** for all environment-specific values. Operator loads it at runtime — no code changes ever needed.
+
+```yaml
+# config/env/prod.yml
+
+project_id: "my-project-prod"
+location: "US"
+gcp_conn_id: "google_cloud_prod"
+sql_bucket: "my-sql-bucket-prod"
+
+# Dataset aliases — logical name → actual dataset
+datasets:
+  cash_mgmt:     "cash_mgmt_prod"
+  core_data:     "core_data_prod"
+  customer:      "customer_prod"
+  reference:     "reference_prod"
+  raw:           "raw_prod"
+
+# Table aliases — @param_name → fully qualified or unqualified table name
+# These become BQ query parameters automatically
+# Add new tables here — zero operator changes needed
+table_params:
+  employee_table:        "employees"                          # unqualified — resolved via defaultDataset
+  payments_table:        "payments_raw"
+  customer_table:        "`my-project-prod.customer_prod.customers`"   # fully qualified — cross dataset
+  reference_table:       "reference_data"
+  product_table:         "`my-project-prod.core_data_prod.products`"
+
+# Global query parameters — available to every SQL automatically
+# Add new ones here — zero operator changes needed
+global_params:
+  environment:    "prod"
+  region:         "US"
+  batch_size:     "10000"
+```
+
+```yaml
+# config/env/dev.yml  — same structure, different values
+
+project_id: "my-project-dev"
+location: "US"
+gcp_conn_id: "google_cloud_dev"
+sql_bucket: "my-sql-bucket-dev"
+
+datasets:
+  cash_mgmt:     "cash_mgmt_dev"
+  core_data:     "core_data_dev"
+  customer:      "customer_dev"
+  reference:     "reference_dev"
+  raw:           "raw_dev"
+
+table_params:
+  employee_table:        "employees"
+  payments_table:        "payments_raw"
+  customer_table:        "`my-project-dev.customer_dev.customers`"
+  reference_table:       "reference_data"
+  product_table:         "`my-project-dev.core_data_dev.products`"
+
+global_params:
+  environment:    "dev"
+  region:         "US"
+  batch_size:     "1000"
+```
+
+---
+
+## GCS Config Structure
+
+```
+gs://my-config-bucket/
+└── config/
+    └── env/
+        ├── dev.yml
+        ├── staging.yml
+        └── prod.yml
+```
+
+One Airflow Variable per deployment tells the operator which config to load:
+
+```
+Airflow Variable:  env__config_path = gs://my-config-bucket/config/env/prod.yml
+```
+
+This is the **only** Airflow Variable you ever need. Everything else lives in the config file.
+
+---
+
+## How SQL Uses Parameters
+
+```sql
+-- sql/cash_management/payments/payments_ingestion.sql
+-- Table names via @param — resolved from env config
+-- run_date via @param — injected by operator from execution context
+-- No Jinja, pure valid SQL, runs directly in BQ console
+
+SELECT
+    p.order_id,
+    p.customer_id,
+    p.total_amount,
+    e.employee_name,
+    @environment        AS env_tag,
+    @run_date           AS run_date
+
+FROM
+    @payments_table     AS p               -- resolved from table_params in env config
+
+JOIN
+    @employee_table     AS e               -- resolved from table_params in env config
+    ON p.employee_id = e.employee_id
+
+WHERE
+    DATE(p.order_date) = @run_date
+    AND p.region = @region                 -- resolved from global_params in env config
+```
+
+---
+
+## Updated Operator — config-driven, zero code changes for new params
+
+```python
+"""
+plugins/operators/gcs_sql_bigquery_operator.py
+
+Fully config-driven operator. All environment-specific values
+(project, datasets, table aliases, global params) are loaded
+from an env config YAML in GCS at runtime.
+
+Adding new table aliases or global params = update env config YAML only.
+Zero operator code changes needed.
+"""
+
+from __future__ import annotations
+import yaml
+from airflow.models import BaseOperator, Variable
+from airflow.providers.google.cloud.hooks.gcs import GCSHook
+from airflow.providers.google.cloud.hooks.bigquery import BigQueryHook
+
+
+class GCSSqlToBigQueryOperator(BaseOperator):
+    """
+    Config-driven operator that:
+    1. Loads environment config from GCS (project, datasets, table aliases, global params)
+    2. Fetches SQL file from GCS
+    3. Builds BQ query parameters from config + YAML overrides + execution context
+    4. Submits BQ job with defaultDataset and resolved parameters
+    """
+
+    template_fields = (
+        "query_gcs_path",
+        "default_dataset_key",
+        "destination_dataset_key",
+        "destination_table_id",
+        "run_date",
+        "query_parameters",
+        "impersonation_chain",
+    )
+
+    ui_color = "#e4f0fb"
+    ui_fgcolor = "#1a73e8"
+
+    def __init__(
+        self,
+        *,
+        query_gcs_path: str,
+
+        # Dataset keys — logical names looked up in env config
+        # e.g. "cash_mgmt" → "cash_mgmt_prod" (resolved at runtime from config)
+        default_dataset_key: str,           # key into config.datasets
+        destination_dataset_key: str,       # key into config.datasets
+        destination_table_id: str,
+
+        # run_date — if None uses Airflow execution_date automatically
+        run_date: str | None = None,
+
+        # Additional query parameters from YAML
+        # These EXTEND config params — can override config values if same key
+        # Format: [{name: "x", type: "STRING", value: "y"}, ...]
+        query_parameters: list | None = None,
+
+        write_disposition: str = "WRITE_TRUNCATE",
+        create_disposition: str = "CREATE_IF_NEEDED",
+        labels: dict | None = None,
+        impersonation_chain: str | list | None = None,
+
+        **kwargs,
+    ) -> None:
+        super().__init__(**kwargs)
+        self.query_gcs_path = query_gcs_path
+        self.default_dataset_key = default_dataset_key
+        self.destination_dataset_key = destination_dataset_key
+        self.destination_table_id = destination_table_id
+        self.run_date = run_date
+        self.query_parameters = query_parameters or []
+        self.write_disposition = write_disposition
+        self.create_disposition = create_disposition
+        self.labels = labels or {}
+        self.impersonation_chain = impersonation_chain
+
+    def _load_env_config(self, gcs_hook: GCSHook) -> dict:
+        """
+        Loads the environment config YAML from GCS.
+        Path is driven by a single Airflow Variable — env__config_path.
+        Zero code changes needed when config content changes.
+        """
+        config_path = Variable.get("env__config_path")
+        bucket, object_path = self._parse_gcs_uri(config_path)
+        self.log.info("Loading env config from '%s'", config_path)
+        raw = gcs_hook.download_as_byte_array(
+            bucket_name=bucket,
+            object_name=object_path,
+        ).decode("utf-8")
+        return yaml.safe_load(raw)
+
+    def _parse_gcs_uri(self, uri: str) -> tuple[str, str]:
+        """Parses gs://bucket/path into (bucket, path)."""
+        if not uri.startswith("gs://"):
+            raise ValueError(f"Expected GCS URI starting with 'gs://'. Got: '{uri}'")
+        without_scheme = uri[len("gs://"):]
+        if "/" not in without_scheme:
+            raise ValueError(f"Cannot parse bucket/object from URI: '{uri}'")
+        bucket, object_path = without_scheme.split("/", 1)
+        return bucket, object_path
+
+    def _build_query_parameters(
+        self,
+        env_config: dict,
+        context: dict,
+    ) -> list[dict]:
+        """
+        Builds the final BQ query parameters list by merging
+        in priority order (lowest → highest):
+
+        1. global_params from env config       e.g. environment, region, batch_size
+        2. table_params from env config        e.g. employee_table, payments_table
+        3. execution context params            e.g. run_date (auto from Airflow)
+        4. query_parameters from YAML          e.g. task-specific overrides
+
+        Higher priority sources override lower ones for the same param name.
+        Adding new params = update env config YAML only, zero code changes.
+        """
+
+        # ── Collect all params into a flat dict keyed by name ───────────────
+        resolved: dict[str, dict] = {}
+
+        # Priority 1 — global params from env config (strings)
+        for name, value in env_config.get("global_params", {}).items():
+            resolved[name] = {
+                "name"          : name,
+                "parameterType" : {"type": "STRING"},
+                "parameterValue": {"value": str(value)},
+            }
+
+        # Priority 2 — table params from env config (strings — BQ table names)
+        for name, value in env_config.get("table_params", {}).items():
+            resolved[name] = {
+                "name"          : name,
+                "parameterType" : {"type": "STRING"},
+                "parameterValue": {"value": str(value)},
+            }
+
+        # Priority 3 — execution context (run_date)
+        run_date = self.run_date or context["ds"]
+        resolved["run_date"] = {
+            "name"          : "run_date",
+            "parameterType" : {"type": "DATE"},
+            "parameterValue": {"value": run_date},
+        }
+
+        # Priority 4 — YAML-level query_parameters (highest priority, can override all)
+        for param in self.query_parameters:
+            resolved[param["name"]] = {
+                "name"          : param["name"],
+                "parameterType" : {"type": param.get("type", "STRING")},
+                "parameterValue": {"value": str(param["value"])},
+            }
+
+        self.log.info(
+            "Resolved %d query parameters: %s",
+            len(resolved),
+            list(resolved.keys()),
+        )
+        return list(resolved.values())
+
+    def execute(self, context: dict) -> None:
+
+        gcs_hook = GCSHook(
+            gcp_conn_id="google_cloud_default",    # always use default for config fetch
+            impersonation_chain=self.impersonation_chain,
+        )
+
+        # ── Step 1: Load env config from GCS ────────────────────────────────
+        env_config = self._load_env_config(gcs_hook)
+        project_id = env_config["project_id"]
+        datasets   = env_config["datasets"]
+
+        # Resolve logical dataset keys → actual dataset names
+        default_dataset  = datasets[self.default_dataset_key]
+        dest_dataset     = datasets[self.destination_dataset_key]
+
+        # ── Step 2: Fetch SQL from GCS ───────────────────────────────────────
+        bucket, object_path = self._parse_gcs_uri(self.query_gcs_path)
+        self.log.info("Fetching SQL from '%s'", self.query_gcs_path)
+        try:
+            sql_content = gcs_hook.download_as_byte_array(
+                bucket_name=bucket,
+                object_name=object_path,
+            ).decode("utf-8")
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to fetch SQL from '{self.query_gcs_path}'. "
+                f"Check file exists and connection has Storage Object Viewer. "
+                f"Error: {e}"
+            ) from e
+
+        self.log.info(
+            "SQL fetched (%d chars). Preview: %.300s", len(sql_content), sql_content
+        )
+
+        # ── Step 3: Build query parameters ──────────────────────────────────
+        query_parameters = self._build_query_parameters(env_config, context)
+
+        # ── Step 4: Submit BQ job ────────────────────────────────────────────
+        configuration = {
+            "query": {
+                "query"           : sql_content,
+                "useLegacySql"    : False,
+                "parameterMode"   : "NAMED",
+                "queryParameters" : query_parameters,
+                "defaultDataset"  : {
+                    "projectId"   : project_id,
+                    "datasetId"   : default_dataset,
+                },
+                "destinationTable": {
+                    "projectId"   : project_id,
+                    "datasetId"   : dest_dataset,
+                    "tableId"     : self.destination_table_id,
+                },
+                "writeDisposition" : self.write_disposition,
+                "createDisposition": self.create_disposition,
+                **({"labels": self.labels} if self.labels else {}),
+            },
+            "jobType": "QUERY",
+        }
+
+        self.log.info(
+            "Submitting BQ job | project: %s | default_dataset: %s | "
+            "destination: %s.%s",
+            project_id, default_dataset, dest_dataset, self.destination_table_id,
+        )
+
+        try:
+            bq_hook = BigQueryHook(
+                gcp_conn_id=env_config.get("gcp_conn_id", "google_cloud_default"),
+                location=env_config.get("location", "US"),
+                impersonation_chain=self.impersonation_chain,
+            )
+            bq_hook.insert_job(configuration=configuration)
+        except Exception as e:
+            raise RuntimeError(
+                f"BQ job failed for '{project_id}.{dest_dataset}"
+                f".{self.destination_table_id}'. Error: {e}"
+            ) from e
+
+        self.log.info(
+            "BQ job completed. Results written to '%s.%s.%s'.",
+            project_id, dest_dataset, self.destination_table_id,
+        )
+```
+
+---
+
+## YAML — clean, no project IDs, no hardcoded values
+
+```yaml
+cash_management__payments__ingestion__daily:
+  schedule: "0 6 * * *"
+  catchup: false
+
+  tasks:
+    run_bq_query:
+      operator: plugins.operators.gcs_sql_bigquery_operator.GCSSqlToBigQueryOperator
+      query_gcs_path: "gs://{{ var.value.env__sql_bucket }}/sql/cash_management/payments/payments_ingestion.sql"
+
+      # Logical dataset keys — resolved from env config at runtime
+      default_dataset_key:      "cash_mgmt"
+      destination_dataset_key:  "cash_mgmt"
+      destination_table_id:     "payments_daily"
+
+      write_disposition: "WRITE_TRUNCATE"
+
+      # Optional — task-specific overrides or additions
+      # These extend and override env config params for this task only
+      query_parameters:
+        - name: "batch_size"
+          type: "INT64"
+          value: "5000"
+```
+
+---
+
+## Parameter Resolution Priority — full picture
+
+```
+┌─────────────────────────────────────────────────────┐
+│              Priority (lowest → highest)            │
+├──────┬──────────────────────────────────────────────┤
+│  1   │ global_params in env config YAML             │
+│      │ environment, region, batch_size              │
+├──────┼──────────────────────────────────────────────┤
+│  2   │ table_params in env config YAML              │
+│      │ employee_table, payments_table, ...          │
+├──────┼──────────────────────────────────────────────┤
+│  3   │ Execution context                            │
+│      │ run_date (auto from Airflow execution_date)  │
+├──────┼──────────────────────────────────────────────┤
+│  4   │ query_parameters in task YAML                │
+│      │ Task-specific overrides — highest priority   │
+└──────┴──────────────────────────────────────────────┘
+```
+
+---
+
+## What Changes Where for Each Scenario
+
+| Scenario | What to update |
+|---|---|
+| New environment (e.g. staging) | Add `config/env/staging.yml` to GCS |
+| New table alias | Add to `table_params` in env config YAML |
+| New global param | Add to `global_params` in env config YAML |
+| New dataset | Add to `datasets` in env config YAML |
+| New project added | Add `project_id` variant or extend config structure |
+| Task-specific param | Add to `query_parameters` in task YAML |
+| Operator logic change | Only time you touch operator code |
+
+The operator code becomes **infrastructure** — stable, rarely touched. All variability lives in config files and YAML, owned by the teams themselves.
