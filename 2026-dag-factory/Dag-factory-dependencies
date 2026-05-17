@@ -1,0 +1,255 @@
+Great question. DAG dependencies in DAG Factory work at two levels — **within a DAG** (task dependencies) and **across DAGs** (DAG dependencies). Let me cover all options.
+
+---
+
+## Level 1 — Task Dependencies Within a DAG
+
+This is straightforward in DAG Factory YAML using the `dependencies` field.
+
+```yaml
+cash_management__payments__ingestion__daily:
+  schedule: "0 6 * * *"
+
+  tasks:
+    extract_raw:
+      operator: plugins.operators.gcs_sql_bigquery_operator.GCSSqlToBigQueryOperator
+      query_gcs_path: "gs://bucket/sql/extract_raw.sql"
+      default_dataset_key: "cash_mgmt"
+      destination_dataset_key: "raw"
+      destination_table_id: "payments_raw"
+      # No dependencies — this runs first
+
+    transform_curated:
+      operator: plugins.operators.gcs_sql_bigquery_operator.GCSSqlToBigQueryOperator
+      query_gcs_path: "gs://bucket/sql/transform_curated.sql"
+      default_dataset_key: "cash_mgmt"
+      destination_dataset_key: "curated"
+      destination_table_id: "payments_curated"
+      dependencies: [extract_raw]              # runs after extract_raw
+
+    load_reporting:
+      operator: plugins.operators.gcs_sql_bigquery_operator.GCSSqlToBigQueryOperator
+      query_gcs_path: "gs://bucket/sql/load_reporting.sql"
+      default_dataset_key: "cash_mgmt"
+      destination_dataset_key: "reporting"
+      destination_table_id: "payments_report"
+      dependencies: [transform_curated]        # runs after transform_curated
+
+    send_notification:
+      operator: airflow.operators.email.EmailOperator
+      to: ["cash-mgmt@company.com"]
+      subject: "Payments ingestion complete"
+      html_content: "Daily payments pipeline finished successfully."
+      dependencies: [load_reporting]           # runs last
+```
+
+This produces:
+```
+extract_raw → transform_curated → load_reporting → send_notification
+```
+
+### Fan-out and Fan-in also supported
+
+```yaml
+  tasks:
+    start:
+      operator: airflow.operators.dummy.DummyOperator
+
+    payments_load:
+      operator: ...
+      dependencies: [start]
+
+    settlements_load:
+      operator: ...
+      dependencies: [start]        # fan-out — both run in parallel after start
+
+    reconciliation:
+      operator: ...
+      dependencies: [payments_load, settlements_load]   # fan-in — waits for both
+```
+
+---
+
+## Level 2 — Cross-DAG Dependencies
+
+This is where it gets more nuanced. There are three options.
+
+---
+
+### Option 1 — ExternalTaskSensor ✅ Most common, fully supported in YAML
+
+Polls until a task or entire DAG in another DAG run completes. Works across YAMLs natively.
+
+```yaml
+# core_data__customer__ingestion__daily.yml
+# This DAG waits for cash_management payments DAG to finish first
+
+core_data__customer__ingestion__daily:
+  schedule: "0 8 * * *"       # runs 2 hours after payments DAG (0 6 * * *)
+  catchup: false
+
+  tasks:
+    wait_for_payments_dag:
+      operator: airflow.sensors.external_task.ExternalTaskSensor
+
+      # The DAG to wait for
+      external_dag_id: "cash_management__payments__ingestion__daily"
+
+      # Wait for the whole DAG (set to None) or a specific task
+      external_task_id: ~                    # ~ means null in YAML — waits for whole DAG
+
+      # How long to wait before giving up (seconds)
+      timeout: 3600                          # 1 hour
+
+      # How often to check (seconds)
+      poke_interval: 60                      # check every minute
+
+      # What mode to run in
+      mode: "reschedule"                     # releases worker slot between checks — recommended
+                                             # use "poke" only for short waits
+
+      # Must match execution_date of the upstream DAG
+      # If both DAGs run on same schedule this is not needed
+      # If schedules differ use execution_delta or execution_date_fn
+      execution_delta:
+        days: 0
+        hours: 0
+
+      allowed_states: ["success"]            # only proceed if upstream succeeded
+      failed_states: ["failed", "skipped"]   # fail immediately if upstream failed
+
+    run_customer_ingestion:
+      operator: plugins.operators.gcs_sql_bigquery_operator.GCSSqlToBigQueryOperator
+      query_gcs_path: "gs://bucket/sql/core_data/customer/customer_ingestion.sql"
+      default_dataset_key: "core_data"
+      destination_dataset_key: "core_data"
+      destination_table_id: "customer_master"
+      dependencies: [wait_for_payments_dag]  # only runs after sensor clears
+```
+
+**Pros** — Pure YAML, no extra infrastructure, simple  
+**Cons** — Polling based (not event driven), `execution_delta` gets tricky when schedules differ, holds a sensor slot
+
+---
+
+### Option 2 — Datasets (Data-Aware Scheduling) ✅ Best for Airflow 2.4+
+
+Event-driven. Upstream DAG declares it updates a Dataset, downstream DAG triggers automatically when that Dataset is updated. No polling, no timing coordination needed.
+
+```yaml
+# Upstream DAG — declares it produces a dataset
+cash_management__payments__ingestion__daily:
+  schedule: "0 6 * * *"
+
+  tasks:
+    run_payments_ingestion:
+      operator: plugins.operators.gcs_sql_bigquery_operator.GCSSqlToBigQueryOperator
+      query_gcs_path: "gs://bucket/sql/payments_ingestion.sql"
+      default_dataset_key: "cash_mgmt"
+      destination_dataset_key: "cash_mgmt"
+      destination_table_id: "payments_daily"
+      # Declare outlet — this task updates this dataset URI
+      outlets:
+        - "bigquery://my-project/cash_mgmt_prod/payments_daily"
+```
+
+```yaml
+# Downstream DAG — triggers when the dataset is updated
+core_data__customer__ingestion__daily:
+
+  # Instead of a cron schedule, trigger on dataset update
+  schedule:
+    - "bigquery://my-project/cash_mgmt_prod/payments_daily"
+
+  tasks:
+    run_customer_ingestion:
+      operator: plugins.operators.gcs_sql_bigquery_operator.GCSSqlToBigQueryOperator
+      query_gcs_path: "gs://bucket/sql/customer_ingestion.sql"
+      default_dataset_key: "core_data"
+      destination_dataset_key: "core_data"
+      destination_table_id: "customer_master"
+```
+
+**Pros** — Truly event-driven, no polling, no timing assumptions, clean decoupling between teams  
+**Cons** — Dataset support in DAG Factory YAML needs testing on your dagfactory version, outlets field support may vary
+
+---
+
+### Option 3 — TriggerDagRunOperator ✅ When you want explicit control
+
+Upstream DAG explicitly triggers downstream DAG as a task. More imperative style — upstream knows about downstream.
+
+```yaml
+cash_management__payments__ingestion__daily:
+  schedule: "0 6 * * *"
+
+  tasks:
+    run_payments_ingestion:
+      operator: plugins.operators.gcs_sql_bigquery_operator.GCSSqlToBigQueryOperator
+      query_gcs_path: "gs://bucket/sql/payments_ingestion.sql"
+      default_dataset_key: "cash_mgmt"
+      destination_dataset_key: "cash_mgmt"
+      destination_table_id: "payments_daily"
+
+    trigger_customer_dag:
+      operator: airflow.operators.trigger_dagrun.TriggerDagRunOperator
+      trigger_dag_id: "core_data__customer__ingestion__daily"
+      wait_for_completion: false       # true = this task waits for triggered DAG to finish
+      reset_dag_run: true              # re-trigger even if run already exists
+      conf:                            # pass context to triggered DAG if needed
+        source_run_date: "{{ ds }}"
+      dependencies: [run_payments_ingestion]
+```
+
+**Pros** — Explicit and easy to reason about, can pass config to downstream DAG  
+**Cons** — Tight coupling — upstream DAG must know about downstream, cross-team coordination needed
+
+---
+
+## Comparison — Which to Use When
+
+| Scenario | Best Option |
+|---|---|
+| Tasks within same DAG | `dependencies` field |
+| Two DAGs on same schedule, one waits for other | `ExternalTaskSensor` |
+| Schedules differ or timing is unpredictable | `Datasets` (event-driven) |
+| Upstream explicitly controls downstream | `TriggerDagRunOperator` |
+| Cross-team, loose coupling preferred | `Datasets` |
+| Cross-team, tight SLA coordination | `ExternalTaskSensor` with `timeout` |
+| Chain of many DAGs across teams | `Datasets` — scales best |
+
+---
+
+## Key Gotcha with ExternalTaskSensor — execution_delta
+
+The most common source of bugs. Both DAGs must align on `execution_date`:
+
+```yaml
+# Payments DAG runs at 06:00 → execution_date = 2024-06-01 06:00
+# Customer DAG runs at 08:00 → execution_date = 2024-06-01 08:00
+# They have DIFFERENT execution_dates for the same logical day
+
+# Fix — tell the sensor to look 2 hours back
+wait_for_payments_dag:
+  operator: airflow.sensors.external_task.ExternalTaskSensor
+  external_dag_id: "cash_management__payments__ingestion__daily"
+  external_task_id: ~
+  execution_delta:
+    hours: 2                 # customer runs 2 hours after payments
+                             # so look 2 hours back for the matching payments run
+```
+
+---
+
+## Recommended Guardrails for Cross-DAG Dependencies
+
+Document these rules in your team onboarding:
+
+| Rule | Why |
+|---|---|
+| Cross-team dependencies need both team leads to approve the PR | Prevents surprise breakages |
+| Always set `timeout` on ExternalTaskSensor | Prevents sensors hanging forever |
+| Always set `failed_states` on ExternalTaskSensor | Fails fast instead of waiting until timeout |
+| Use `mode: reschedule` not `mode: poke` | Releases worker slots between checks |
+| Maintain a central dependency map doc | So schedule changes don't blindside downstream teams |
+| Prefer Datasets over ExternalTaskSensor for new pipelines | More resilient to schedule changes |
