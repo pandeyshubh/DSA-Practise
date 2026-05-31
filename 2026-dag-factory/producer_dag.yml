@@ -1,0 +1,45 @@
+# ============================================================
+# producer_dag.yml
+#
+# PRODUCER DAG — runs on a cron schedule.
+# When task_1 completes it emits the dataset URI:
+#   "cash_management.payments_daily"
+#
+# Airflow sees this outlet and marks the dataset as "updated".
+# Any consumer DAG scheduled against this URI is then triggered.
+#
+# Uses BashOperator — no GCP needed, works locally for testing.
+# ============================================================
+
+cash_management__payments__producer:
+  default_args:
+    owner: "cash_mgmt_team"
+    start_date: "2024-01-01"
+    retries: 1
+
+  description: "Producer DAG — emits cash_management.payments_daily dataset"
+  schedule: "0 6 * * *"     # runs daily at 06:00 UTC
+  catchup: false
+  tags:
+    - producer
+    - cash_management
+    - dataset_test
+
+  tasks:
+    - task_id: task_1_extract
+      operator: airflow.operators.bash.BashOperator
+      bash_command: "echo 'Extracting payments data for {{ ds }}'"
+      # This task emits the dataset URI when it succeeds.
+      # URI is just a logical string — not a real file or location.
+      # Consumer DAGs scheduled on this URI will trigger automatically.
+      outlets:
+        - "cash_management.payments_daily"
+
+    - task_id: task_2_validate
+      operator: airflow.operators.bash.BashOperator
+      bash_command: "echo 'Validating payments data for {{ ds }}'"
+      dependencies: [task_1_extract]
+      # task_2 does NOT emit the dataset — only task_1 does.
+      # Consumer DAG triggers as soon as task_1 succeeds,
+      # not necessarily after the whole producer DAG finishes.
+      # Move outlets here if you want consumer to wait for validation too.

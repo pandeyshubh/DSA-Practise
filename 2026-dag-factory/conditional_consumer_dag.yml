@@ -1,0 +1,61 @@
+# ============================================================
+# conditional_consumer_dag.yml
+#
+# ADVANCED CONSUMER — shows AND / OR dataset conditions.
+# Requires: dagfactory 1.0.1 + Airflow 2.9+ (you are on 2.10 ✅)
+#
+# Two DAGs shown here:
+#   1. AND condition — triggers only when BOTH datasets updated
+#   2. OR  condition — triggers when ANY one dataset updated
+# ============================================================
+
+# ── AND condition ────────────────────────────────────────────
+# Triggers only after BOTH payments AND settlements are updated.
+# Useful for reconciliation that needs both inputs ready.
+cash_management__reconciliation__and_consumer:
+  default_args:
+    owner: "cash_mgmt_team"
+    start_date: "2024-01-01"
+
+  description: "Triggers only when BOTH payments AND settlements datasets are updated"
+
+  # String form with & operator — AND logic
+  schedule: "cash_management.payments_daily & cash_management.settlements_daily"
+
+  catchup: false
+  tags:
+    - consumer
+    - conditional
+    - dataset_test
+
+  tasks:
+    - task_id: run_reconciliation
+      operator: airflow.operators.bash.BashOperator
+      bash_command: "echo 'Running reconciliation — both datasets ready'"
+      inlets:
+        - "cash_management.payments_daily"
+        - "cash_management.settlements_daily"
+
+# ── OR condition ─────────────────────────────────────────────
+# Triggers when EITHER payments OR customer master is updated.
+# Useful for a reporting DAG that refreshes on any upstream change.
+reporting__dashboard__or_consumer:
+  default_args:
+    owner: "reporting_team"
+    start_date: "2024-01-01"
+
+  description: "Triggers when EITHER payments OR customer master dataset is updated"
+
+  # String form with | operator — OR logic
+  schedule: "cash_management.payments_daily | core_data.customer_master"
+
+  catchup: false
+  tags:
+    - consumer
+    - conditional
+    - dataset_test
+
+  tasks:
+    - task_id: refresh_dashboard
+      operator: airflow.operators.bash.BashOperator
+      bash_command: "echo 'Refreshing dashboard — at least one upstream dataset updated'"

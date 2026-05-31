@@ -1,0 +1,50 @@
+# ============================================================
+# consumer_dag.yml
+#
+# CONSUMER DAG — triggered by dataset, not by cron.
+#
+# Airflow watches for the URI "cash_management.payments_daily"
+# to be emitted (via outlets in the producer DAG).
+# When it fires, this DAG is triggered automatically.
+#
+# schedule is a LIST of dataset URI strings — not a cron string.
+# The DAG triggers when ALL listed datasets are updated (AND logic).
+#
+# Uses BashOperator — no GCP needed, works locally for testing.
+# ============================================================
+
+core_data__customer__consumer:
+  default_args:
+    owner: "core_data_team"
+    start_date: "2024-01-01"
+    retries: 1
+
+  description: "Consumer DAG — triggered when cash_management.payments_daily is updated"
+
+  # KEY POINT: schedule is a LIST of dataset URI strings here,
+  # NOT a cron expression. dagfactory passes this directly
+  # to Airflow's Dataset scheduling mechanism.
+  # No special handling needed in dag_loader.py.
+  schedule:
+    - "cash_management.payments_daily"    # must exactly match the outlets URI in producer
+
+  catchup: false
+  tags:
+    - consumer
+    - core_data
+    - dataset_test
+
+  tasks:
+    - task_id: task_1_ingest
+      operator: airflow.operators.bash.BashOperator
+      bash_command: "echo 'Running customer ingestion triggered by payments dataset'"
+      inlets:
+        - "cash_management.payments_daily"    # optional — marks lineage in Airflow UI
+      outlets:
+        - "core_data.customer_master"         # this DAG also produces a dataset
+                                              # a third DAG could consume this too
+
+    - task_id: task_2_validate
+      operator: airflow.operators.bash.BashOperator
+      bash_command: "echo 'Validating customer master data'"
+      dependencies: [task_1_ingest]
