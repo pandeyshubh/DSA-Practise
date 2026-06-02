@@ -1,0 +1,283 @@
+Here is everything you need to fill in the GitHub bug report:
+
+---
+
+## 1) Title
+```
+Dataset-based scheduling via YAML fails on Airflow 2.10.5 — AttributeError: 'Dataset' object has no attribute 'strip' / 'isspace'
+```
+
+---
+
+## 2) DAG Factory Version
+```
+1.0.1
+```
+
+---
+
+## 3) Airflow Version
+```
+2.10.5
+```
+
+---
+
+## 4) Python Version
+```
+3.11
+```
+
+---
+
+## 5) Deployment
+```
+GCP Cloud Composer
+```
+
+---
+
+## 6) What Happened
+
+```
+I am building a declarative, YAML-based DAG pipeline framework using dagfactory.
+I am attempting to implement cross-DAG dependencies using Airflow's native
+Dataset-based scheduling — entirely in YAML without any Python DAG files.
+
+Two approaches were attempted:
+
+─── Approach 1: Plain string URIs in schedule and outlets ───────────────────
+
+consumer_dag.yml:
+  schedule:
+    - "cash_management.payments_daily"
+
+This fails with Airflow 2.10.5 because Airflow 2.10 enforces strict type
+checking on the schedule parameter and requires actual Dataset objects,
+not plain strings. Error:
+
+  ValueError: All elements of Schedule should be datasets or dataset aliases
+
+─── Approach 2: __type__ syntax to instantiate Dataset objects ──────────────
+
+consumer_dag.yml:
+  schedule:
+    - __type__: airflow.datasets.Dataset
+      uri: "cash_management.payments_daily"
+
+dagfactory correctly instantiates the Dataset object via __type__, but its
+internal schedule parsing code subsequently calls string methods (.strip(),
+then .isspace()) on the Dataset object — treating it as a cron string.
+This raises:
+
+  AttributeError: 'Dataset' object has no attribute 'strip'
+
+And after monkey-patching strip(), the next failure is:
+
+  AttributeError: 'Dataset' object has no attribute 'isspace'
+
+This suggests dagfactory's schedule parsing pipeline calls multiple string
+methods in sequence to detect cron expressions, and does not handle the case
+where schedule items are already Dataset objects.
+
+Note: Python-based DAGs using Dataset scheduling work correctly because they
+bypass dagfactory's schedule parsing entirely and pass Dataset objects
+directly to Airflow's DAG constructor.
+```
+
+---
+
+## 7) Relevant Log Output
+
+```
+─── Error from Approach 1 (plain strings) ───────────────────────────────────
+
+Broken DAG: [/path/to/dags/consumer_dag.yml]
+Traceback (most recent call last):
+  ...
+  File ".../airflow/models/dag.py", line ..., in ...
+    raise ValueError(
+ValueError: All elements of Schedule should be datasets or dataset aliases
+
+─── Error from Approach 2 (__type__ Dataset objects) ────────────────────────
+
+Broken DAG: [/path/to/dags/consumer_dag.yml]
+Traceback (most recent call last):
+  ...
+  File ".../dagfactory/dagbuilder.py", line ..., in build
+    schedule = schedule.strip()
+AttributeError: 'Dataset' object has no attribute 'strip'
+
+─── After monkey-patching strip() ───────────────────────────────────────────
+
+Broken DAG: [/path/to/dags/consumer_dag.yml]
+Traceback (most recent call last):
+  ...
+  File ".../dagfactory/dagbuilder.py", line ..., in build
+    if schedule.isspace():
+AttributeError: 'Dataset' object has no attribute 'isspace'
+```
+
+---
+
+## 8) How to Reproduce
+
+**Minimal reproduction — three files:**
+
+**dag_loader.py**
+```python
+import os
+from dagfactory import load_yaml_dags
+
+load_yaml_dags(
+    globals_dict=globals(),
+    dags_folder=os.path.dirname(__file__),
+)
+```
+
+**producer_dag.yml**
+```yaml
+test__producer:
+  default_args:
+    owner: "test"
+    start_date: "2024-01-01"
+  schedule: "0 6 * * *"
+  catchup: false
+  tasks:
+    - task_id: task_extract
+      operator: airflow.operators.bash.BashOperator
+      bash_command: "echo 'producer running'"
+      outlets:
+        - __type__: airflow.datasets.Dataset
+          uri: "test.dataset_a"
+```
+
+**consumer_dag.yml**
+```yaml
+test__consumer:
+  default_args:
+    owner: "test"
+    start_date: "2024-01-01"
+  schedule:
+    - __type__: airflow.datasets.Dataset
+      uri: "test.dataset_a"
+  catchup: false
+  tasks:
+    - task_id: task_ingest
+      operator: airflow.operators.bash.BashOperator
+      bash_command: "echo 'consumer running'"
+      inlets:
+        - __type__: airflow.datasets.Dataset
+          uri: "test.dataset_a"
+```
+
+**Steps:**
+1. Install `dag-factory==1.0.1` and `apache-airflow==2.10.5`
+2. Place all three files in the Airflow `dags/` folder
+3. Start the Airflow scheduler
+4. Observe `AttributeError: 'Dataset' object has no attribute 'strip'` in the DAG import errors panel
+5. As a secondary test, replace `__type__` with plain string URIs in `schedule` and observe `ValueError: All elements of Schedule should be datasets or dataset aliases`
+
+---
+
+## 9) Anything Else
+
+```
+Root Cause Analysis:
+
+dagfactory's internal schedule parsing in dagbuilder.py assumes all schedule
+values are strings and calls string methods to detect cron expressions
+(e.g. strip(), isspace(), startswith() for "@" presets, __contains__ for
+"*" and "/" cron characters). When a Dataset object is present in the
+schedule list — correctly instantiated via __type__ — these string method
+calls fail.
+
+This is a version compatibility gap:
+
+  - dagfactory 1.0.1 documentation and examples target Airflow 3, where
+    Airflow natively accepts plain string URIs in schedule and converts them
+    to Dataset objects automatically.
+  - Airflow 2.10 does not perform this auto-conversion and requires actual
+    Dataset objects, forcing the use of __type__ in YAML.
+  - But __type__-instantiated Dataset objects then fail dagfactory's own
+    string-based schedule parsing.
+
+Current workaround applied in dag_loader.py to unblock our team:
+
+  from airflow.datasets import Dataset
+  Dataset.strip       = lambda self, chars=None: self
+  Dataset.isspace     = lambda self: False
+  Dataset.lower       = lambda self: self
+  Dataset.upper       = lambda self: self
+  Dataset.startswith  = lambda self, prefix, *a: False
+  Dataset.__contains__ = lambda self, item: False
+
+This works but is fragile and should not be needed. The fix should live
+inside dagfactory itself.
+
+Impact: Any team using dagfactory 1.0.1 on Airflow 2.10.x with YAML-based
+Dataset scheduling will hit this error. Python-based DAGs are unaffected
+because they bypass dagfactory's schedule parsing entirely.
+```
+
+---
+
+## 10) PR Fix Suggestion
+
+Point to this specific code block in `dagbuilder.py` — the schedule parsing section that needs a type guard added before any string method is called:
+
+**Location in dagfactory source:**
+```
+dagfactory/dagbuilder.py — method that processes the schedule config key
+```
+
+**The fix — add an isinstance guard before any string method call:**
+
+```python
+# CURRENT CODE (approximate) — assumes schedule is always a string
+if isinstance(schedule, str):
+    schedule = schedule.strip()
+    if not schedule or schedule.isspace():
+        schedule = None
+
+# PROPOSED FIX — handle list of Dataset objects explicitly
+# Import at top of file:
+# from airflow.datasets import Dataset  (with try/except for Airflow 2.3 compatibility)
+
+try:
+    from airflow.datasets import Dataset as AirflowDataset
+    HAS_DATASET = True
+except ImportError:
+    HAS_DATASET = False
+
+
+def _parse_schedule(schedule):
+    """
+    Parse the schedule config value into the correct Airflow schedule type.
+    Handles cron strings, Airflow presets, None, and Dataset lists.
+    """
+    # ── Dataset list ─────────────────────────────────────────────
+    # Check BEFORE any string operations — Dataset objects have no .strip()
+    if isinstance(schedule, list) and HAS_DATASET:
+        if all(isinstance(item, AirflowDataset) for item in schedule):
+            return schedule   # pass through unchanged to Airflow DAG constructor
+
+    # ── Conditional dataset expressions (Airflow 2.9+ / Airflow 3) ──
+    if HAS_DATASET and isinstance(schedule, AirflowDataset):
+        return schedule
+
+    # ── Existing string-based parsing (unchanged) ────────────────
+    if isinstance(schedule, str):
+        schedule = schedule.strip()
+        if not schedule or schedule.isspace():
+            return None
+        return schedule
+
+    return schedule
+```
+
+**Why this fix is correct:**
+- Checks `isinstance(item, Dataset)` before calling any string methods — no more AttributeError
+- Falls through to existing string parsing for all cron strings and presets — no regression
+- Wrapped in `try/except ImportError` so it stays compatible with Airflow versions that predate Dataset support
+- Works for both `Airflow 2.10` (strict Dataset objects) and `Airflow 3` (plain strings) without any changes to user YAML
